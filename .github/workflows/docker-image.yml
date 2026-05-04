@@ -1,50 +1,197 @@
-name: Publish Docker Image
-on: 
+name: GitHub CI
+on:
   push:
     branches: [ master ]
     tags:
       - '**'
+  workflow_dispatch:
+  pull_request:
 
-concurrency: 
+concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}
   cancel-in-progress: true
 
 env:
-  # 改为 GitHub 容器镜像地址格式：ghcr.io/用户名/仓库名
   REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/subconverter
 
 jobs:
-  build:
+  # ==========================
+  # 原有二进制构建（保留不动）
+  # ==========================
+  linux_build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86
+            artifact: subconverter_linux32
+            os: ubuntu-latest
+          - arch: amd64
+            artifact: subconverter_linux64
+            os: ubuntu-latest
+          - arch: armv7
+            artifact: subconverter_armv7
+            os: ubuntu-latest
+          - arch: aarch64
+            artifact: subconverter_aarch64
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    name: Linux ${{ matrix.arch }} Build
+    steps:
+      - name: Checkout base
+        uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Add commit id into version
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: SHA=$(git rev-parse --short HEAD) && sed -i 's/\(v[0-9]\.[0-9]\.[0-9]\)/\1-'"$SHA"'/' src/version.h
+      - name: Build
+        run: docker run --rm -v $GITHUB_WORKSPACE:/root/workdir multiarch/alpine:${{ matrix.arch }}-latest-stable /bin/sh -c "apk add bash git nodejs npm && cd /root/workdir && chmod +x scripts/build.alpine.release.sh && bash scripts/build.alpine.release.sh"
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: subconverter/
+      - name: Package Release
+        if: ${{ github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/') }}
+        run: tar czf ${{ matrix.artifact }}.tar.gz subconverter
+      - name: Draft Release
+        if: ${{ github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}.tar.gz
+          draft: true
+
+  macos_build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86
+            artifact: subconverter_darwin64
+            os: macos-15
+          - arch: arm
+            artifact: subconverter_darwinarm
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    name: macOS ${{ matrix.arch }} Build
+    steps:
+      - name: Checkout base
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Add commit id into version
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: SHA=$(git rev-parse --short HEAD) && sed -i -e 's/\(v[0-9]\.[0-9]\.[0-9]\)/\1-'"$SHA"'/' src/version.h
+      - name: Build
+        run: bash scripts/build.macos.release.sh
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: subconverter/
+      - name: Package Release
+        if: ${{ github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/') }}
+        run: tar czf ${{ matrix.artifact }}.tar.gz subconverter
+      - name: Draft Release
+        if: ${{ github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}.tar.gz
+          draft: true
+
+  windows_build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86
+            artifact: subconverter_win32
+            env: i686
+            msystem: MINGW32
+          - arch: amd64
+            artifact: subconverter_win64
+            env: x86_64
+            msystem: MINGW64
+    runs-on: windows-latest
+    name: Windows ${{ matrix.arch }} Build
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout base
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: base-devel git mingw-w64-${{ matrix.env }}-gcc mingw-w64-${{ matrix.env }}-cmake mingw-w64-${{ matrix.env }}-pcre2 patch
+          msystem: ${{ matrix.msystem }}
+          path-type: inherit
+      - name: Add commit id into version
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: SHA=$(git rev-parse --short HEAD) && sed -i 's/\(v[0-9]\.[0-9]\.[0-9]\)/\1-'"$SHA"'/' src/version.h
+      - name: Build
+        run: bash scripts/build.windows.release.sh
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: subconverter/
+      - name: Package Release
+        if: ${{ github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/') }}
+        run: 7z a ${{ matrix.artifact }}.7z subconverter/
+      - name: Draft Release
+        if: ${{ github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}.7z
+          draft: true
+
+  # ==========================
+  # 新增：多架构 Docker 构建并推送到 ghcr.io
+  # ==========================
+  build_docker:
+    needs: [linux_build]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - platform: linux/amd64
-            os: ubuntu-latest
           - platform: linux/386
-            os: ubuntu-latest
           - platform: linux/arm/v7
-            os: ubuntu-latest
           - platform: linux/arm64
-            os: ubuntu-latest
-    runs-on: ${{ matrix.os }}
-    name: Build ${{ matrix.platform }} Image
+
+    name: Build Docker ${{ matrix.platform }}
     steps:
-      - name: Prepare
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set platform
         run: |
           platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV    
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
 
-      - name: Checkout base
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
@@ -54,59 +201,61 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
 
-      # 登录 GitHub 容器仓库（ghcr.io）
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Get commit SHA
         if: github.ref == 'refs/heads/master'
-        id: vars
-        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      - name: Build and export
+      - name: Build and push
         id: build
         uses: docker/build-push-action@v5
         with:
-          platforms: ${{ matrix.platform }}
           context: scripts/
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            SHA=${{ steps.vars.outputs.sha_short }}
-          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: SHA=${{ env.sha_short }}
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
 
       - name: Export digest
+        if: ${{ github.event_name != 'pull_request' }}
         run: |
-          rm -rf /tmp/digests
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
-      - name: Upload artifact
+      - name: Upload digest
+        if: ${{ github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ env.PLATFORM_PAIR }}
+          name: digests-${{ env.PLATFORM_PAIR }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    name: Merge
-    needs: build
+  # ==========================
+  # 合并多架构镜像（ghcr.io）
+  # ==========================
+  merge_docker:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
+    needs: build_docker
+    name: Merge Docker Manifests
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digest-*
+          pattern: digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker meta
         id: meta
@@ -117,20 +266,13 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
 
-      # 合并阶段也登录 GitHub 容器仓库
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create manifest list and push
+      - name: Create manifest
         working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)      
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
 
-      - name: Inspect image
+      - name: Inspect
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
